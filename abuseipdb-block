@@ -25,7 +25,7 @@
 # API key: /etc/abuseipdb.key (the key only, chmod 600)
 # Cron:    @reboot    root /usr/local/sbin/abuseipdb-block -r -q
 #          37 3 * * * root /usr/local/sbin/abuseipdb-block -q
-# https://github.com/OWNER/abuseipdb-block — MIT License
+# https://github.com/colemar/abuseipdb-block — MIT License
 set -uo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
 
