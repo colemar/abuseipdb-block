@@ -19,7 +19,7 @@ using a single nftables set. One bash script, no daemon, no dependencies beyond
 ## Requirements
 
 - Linux with nftables (`nft`), conntrack, `curl`, bash 4+
-- An AbuseIPDB account and [API key](https://www.abuseipdb.com/account/api), unless you
+- An AbuseIPDB account and [API key](https://www.abuseipdb.com/account/api/keys), unless you
   use the borestad lists (see below)
 
 | Plan | IPs returned | `confidenceMinimum` |
