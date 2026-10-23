@@ -1,0 +1,6 @@
+# /etc/cron.d/abuseipdb-block
+# MAILTO=you@example.com
+# reload the saved list at boot (nftables rules do not survive a reboot)
+@reboot    root /usr/local/sbin/abuseipdb-block -r -q
+# daily update; pick a random minute to spread the load on the API
+37 3 * * * root /usr/local/sbin/abuseipdb-block -q

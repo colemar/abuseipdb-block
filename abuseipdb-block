@@ -1,0 +1,181 @@
+#!/bin/bash
+# abuseipdb-block — drop inbound traffic from IPs on the AbuseIPDB blacklist (nftables).
+#  Downloads the blacklist once a day and loads it into a dedicated nftables table
+#  (inet abuseipdb) that does not touch rules owned by other tools: two sets (bl4, bl6)
+#  and one rule per address family. Every update replaces the whole table atomically,
+#  so IPs that drop off the list are unblocked automatically.
+#  Only new inbound connections are dropped (ct state new): replies to connections opened
+#  by this host still get through.
+#  Addresses in ALLOW (config file) are never blocked.
+#  If the download fails or the response is invalid, the previous list stays loaded; if no
+#  update succeeds for MAXAGE days the table is removed, as AbuseIPDB asks for stale lists.
+#  The last good list is saved in STATE: at boot, -r reloads it without downloading.
+#  Paid plans return every IP at confidenceMinimum (up to LIMIT); the free plan ignores
+#  confidenceMinimum (fixed at 100) and silently truncates to 10,000 IPs. No change needed.
+# Usage: abuseipdb-block [-c FILE] [-q] [-n]   download and apply the list
+#        abuseipdb-block -r [-q]                reload the last saved list (for boot)
+#        abuseipdb-block -s                     status: loaded IPs, list age, dropped packets
+#        abuseipdb-block -u IP                  unblock IP now (until the next update;
+#                                               permanently: add it to ALLOW)
+#        abuseipdb-block -x                     remove the table (until the next update)
+#   -c FILE  config file (default /etc/abuseipdb-block.conf)
+#   -q       quiet unless something goes wrong (for cron)
+#   -n       download and verify, do not apply
+#   -h       this help
+# API key: /etc/abuseipdb.key (the key only, chmod 600)
+# Cron:    @reboot    root /usr/local/sbin/abuseipdb-block -r -q
+#          37 3 * * * root /usr/local/sbin/abuseipdb-block -q
+# https://github.com/OWNER/abuseipdb-block — MIT License
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+
+# defaults, overridable in the config file
+CONFFILE=/etc/abuseipdb-block.conf
+ALLOW=""          # never blocked: IPs or CIDRs, space separated
+KEYFILE=/etc/abuseipdb.key
+STATE=/var/lib/abuseipdb-block
+CONF=100          # confidenceMinimum (honoured by paid plans only)
+LIMIT=100000      # max IPs requested (free plan truncates to 10,000)
+MINIPS=1000       # fewer IPs than this = abnormal response
+MAXAGE=3          # days after which a list that cannot be updated is removed
+TABLE="inet abuseipdb"
+
+MODE=update QUIET=0 DRY=0 UIP=""
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+while getopts hc:qnrsxu: o; do
+  case $o in
+    h) usage ;; c) CONFFILE=$OPTARG ;; q) QUIET=1 ;; n) DRY=1 ;; r) MODE=restore ;;
+    s) MODE=status ;; x) MODE=remove ;; u) MODE=unblock UIP=$OPTARG ;; *) usage 2 ;;
+  esac
+done
+shift $((OPTIND - 1)); (( $# )) && usage 2
+[[ $EUID -eq 0 ]] || { echo "Must run as root." >&2; exit 2; }
+for c in nft curl; do command -v $c >/dev/null || { echo "Missing command: $c" >&2; exit 2; }; done
+
+# the config is sourced as root: refuse it unless owned by root and not writable by others
+if [[ -e $CONFFILE ]]; then
+  read -r own mode < <(stat -L -c '%u %a' "$CONFFILE")
+  (( own == 0 && (8#$mode & 8#022) == 0 )) || { echo "$CONFFILE must be owned by root and not group/world-writable." >&2; exit 2; }
+  # shellcheck source=/dev/null
+  . "$CONFFILE"
+fi
+
+exec 9>/run/abuseipdb-block.lock; flock -w 60 9 || { echo "abuseipdb-block is already running." >&2; exit 2; }
+
+LIST=$STATE/blacklist.txt     # last list applied successfully (mtime = when)
+INFO=$STATE/info              # "date time n4 n6 generated-at"
+mkdir -p "$STATE"
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+say() { (( QUIET )) || echo "$*"; }
+age() { echo $(( ($(date +%s) - $(stat -c %Y "$1")) / 86400 )); }   # days
+isip() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || ( $1 == *:* && $1 =~ ^[0-9a-fA-F:.]+$ ) ]]; }
+
+# update error: keep the current table, but remove it if the list has expired
+fail() {
+  echo "abuseipdb-block: $*" >&2
+  if [[ -f $LIST ]] && (( $(age "$LIST") >= MAXAGE )) && nft list table $TABLE >/dev/null 2>&1; then
+    nft delete table $TABLE && echo "List not updated for $(age "$LIST") days: blocking removed." >&2
+  else
+    echo "The previous list stays active." >&2
+  fi
+  exit 1
+}
+
+# "add element" lines in chunks of 2000 IPs (stdin: one IP per line)
+elements() {
+  awk -v t="$TABLE" -v s="$1" '
+    NR % 2000 == 1 { if (NR > 1) print " }"; printf "add element %s %s { %s", t, s, $0; next }
+    { printf ", %s", $0 }
+    END { if (NR) print " }" }'
+}
+
+# replace the whole table in a single transaction (all or nothing)
+apply() {
+  local f=$1 a
+  {
+    echo "table $TABLE"
+    echo "delete table $TABLE"
+    echo "table $TABLE {"
+    echo "  set allow4 { type ipv4_addr; flags interval; }"
+    echo "  set allow6 { type ipv6_addr; flags interval; }"
+    echo "  set bl4 { type ipv4_addr; size 262144; }"
+    echo "  set bl6 { type ipv6_addr; size 262144; }"
+    echo "  chain input {"
+    echo "    type filter hook input priority filter - 5; policy accept;"
+    echo "    ct state != new return"
+    echo "    ip saddr @allow4 return"
+    echo "    ip6 saddr @allow6 return"
+    echo "    ip saddr @bl4 counter drop"
+    echo "    ip6 saddr @bl6 counter drop"
+    echo "  }"
+    echo "}"
+    for a in $ALLOW; do
+      if [[ $a == *:* ]]; then echo "add element $TABLE allow6 { $a }"; else echo "add element $TABLE allow4 { $a }"; fi
+    done
+    grep -v : "$f" | elements bl4
+    grep    : "$f" | elements bl6
+  } > "$tmp/rules.nft"
+  nft -c -f "$tmp/rules.nft" 2>"$tmp/err" || return 1
+  (( DRY )) && return 0
+  nft -f "$tmp/rules.nft" 2>"$tmp/err"
+}
+
+case $MODE in
+status)
+  if [[ -f $INFO ]]; then
+    read -r d t n4 n6 gen < "$INFO"
+    echo "Last update: $d $t ($(age "$LIST") days ago), $n4 IPv4 + $n6 IPv6, list generated $gen"
+  else
+    echo "No successful update yet."
+  fi
+  if nft list chain $TABLE input >/dev/null 2>&1; then
+    nft list chain $TABLE input | awk '/counter/ { for (i = 1; i <= NF; i++) if ($i == "packets") print "  dropped by", $3 ":", $(i+1), "packets" }'
+  else
+    echo "Table $TABLE not loaded: blocking inactive."
+  fi
+  exit 0 ;;
+remove)
+  nft delete table $TABLE 2>/dev/null && echo "Table $TABLE removed: blocking inactive until the next update." \
+    || echo "Table $TABLE not present."
+  exit 0 ;;
+unblock)
+  isip "$UIP" || { echo "Invalid IP: $UIP" >&2; exit 2; }
+  s=bl4; [[ $UIP == *:* ]] && s=bl6
+  if nft get element $TABLE $s "{ $UIP }" >/dev/null 2>&1; then
+    nft delete element $TABLE $s "{ $UIP }" && echo "$UIP unblocked until the next update. Permanently: add it to ALLOW in $CONFFILE"
+  else
+    echo "$UIP is not in the loaded list."
+  fi
+  exit 0 ;;
+restore)
+  [[ -s $LIST ]] || { echo "abuseipdb-block: no saved list." >&2; exit 1; }
+  (( $(age "$LIST") < MAXAGE )) || { echo "abuseipdb-block: saved list expired ($(age "$LIST") days), not loaded." >&2; exit 1; }
+  apply "$LIST" || { echo "abuseipdb-block: nft rejected the list: $(head -3 "$tmp/err")" >&2; exit 1; }
+  say "Reloaded $(grep -vc : "$LIST") IPv4 + $(grep -c : "$LIST") IPv6 from the saved list."
+  exit 0 ;;
+esac
+
+# ---------- update ----------
+[[ -r $KEYFILE ]] || fail "API key not readable: $KEYFILE"
+code=$(curl -sS --max-time 120 -G https://api.abuseipdb.com/api/v2/blacklist \
+         -H "Key: $(tr -d '[:space:]' < "$KEYFILE")" -H "Accept: text/plain" \
+         -d confidenceMinimum="$CONF" -d limit="$LIMIT" -d plaintext \
+         -D "$tmp/hdr" -o "$tmp/raw" -w '%{http_code}' 2>"$tmp/err") \
+  || fail "download failed: $(head -1 "$tmp/err")"
+[[ $code == 200 ]] || fail "HTTP $code: $(head -c 300 "$tmp/raw")"
+
+# the last line has no trailing newline: add it; drop \r and empty lines
+{ cat "$tmp/raw"; echo; } | tr -d '\r' | sed '/^$/d' | sort -u > "$tmp/new"
+bad=$(grep -vE '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F.]*:[0-9a-fA-F:.]*$' "$tmp/new" | head -3)
+[[ -z $bad ]] || fail "invalid response, lines like: $(tr '\n' ' ' <<<"$bad")"
+n=$(wc -l < "$tmp/new")
+(( n >= MINIPS )) || fail "only $n IPs received (minimum $MINIPS)"
+gen=$(sed -n 's/^[Xx]-[Gg]enerated-[Aa]t: *//p' "$tmp/hdr" | tr -d '\r' | head -1)
+n4=$(grep -vc : "$tmp/new"); n6=$(grep -c : "$tmp/new")
+
+apply "$tmp/new" || fail "nft rejected the list: $(head -3 "$tmp/err")"
+if (( DRY )); then echo "Check OK: $n4 IPv4 + $n6 IPv6 (list generated ${gen:-?}), not applied."; exit 0; fi
+mv -f "$tmp/new" "$LIST"; chmod 644 "$LIST"
+echo "$(date '+%F %T') $n4 $n6 ${gen:-?}" > "$INFO"
+say "Loaded $n4 IPv4 + $n6 IPv6 (list generated ${gen:-?})."

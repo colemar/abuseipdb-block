@@ -1,0 +1,13 @@
+# /etc/abuseipdb-block.conf — sourced by abuseipdb-block (bash syntax).
+# Must be owned by root and not group/world-writable.
+
+# Never blocked, even if listed: this host, your home/office IPs, monitoring, etc.
+# IPs or CIDRs, IPv4 and IPv6, space separated.
+ALLOW="192.0.2.10 2001:db8:1234::/64"
+
+# KEYFILE=/etc/abuseipdb.key   # file containing only the API key (chmod 600)
+# STATE=/var/lib/abuseipdb-block
+# CONF=100       # confidenceMinimum, 25-100 (paid plans only)
+# LIMIT=100000   # max IPs requested (free 10,000, Basic 100,000, Premium 500,000)
+# MINIPS=1000    # fewer IPs than this = abnormal response, list not applied
+# MAXAGE=3       # days: a list that cannot be updated is removed after this
