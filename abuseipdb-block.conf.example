@@ -5,7 +5,12 @@
 # IPs or CIDRs, IPv4 and IPv6, space separated.
 ALLOW="192.0.2.10 2001:db8:1234::/64"
 
-# KEYFILE=/etc/abuseipdb.key   # file containing only the API key (chmod 600)
+# Source: empty = AbuseIPDB API (needs KEYFILE); a period = the borestad/blocklist-abuseipdb
+# list for that period, no API key: 1d 3d 7d 14d 30d 60d 90d 120d 180d 365d (IPv4 only;
+# the author recommends 30d or less). "-b PERIOD" / "-b api" on the command line wins.
+# BORESTAD=30d
+
+# KEYFILE=/etc/abuseipdb.key  # file containing only the API key (chmod 600)
 # STATE=/var/lib/abuseipdb-block
 # CONF=100       # confidenceMinimum, 25-100 (paid plans only)
 # LIMIT=100000   # max IPs requested (free 10,000, Basic 100,000, Premium 500,000)

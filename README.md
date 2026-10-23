@@ -19,7 +19,8 @@ using a single nftables set. One bash script, no daemon, no dependencies beyond
 ## Requirements
 
 - Linux with nftables (`nft`), conntrack, `curl`, bash 4+
-- An AbuseIPDB account and [API key](https://www.abuseipdb.com/account/api/keys)
+- An AbuseIPDB account and [API key](https://www.abuseipdb.com/account/api), unless you
+  use the borestad lists (see below)
 
 | Plan | IPs returned | `confidenceMinimum` |
 |------|--------------|---------------------|
@@ -29,6 +30,21 @@ using a single nftables set. One bash script, no daemon, no dependencies beyond
 
 The script works unchanged on any plan: the API silently truncates the list to the
 plan's limit. The free plan allows 5 blacklist requests per day; the script uses one.
+
+### Alternative source: borestad/blocklist-abuseipdb
+
+[borestad/blocklist-abuseipdb](https://github.com/borestad/blocklist-abuseipdb) publishes
+aggregated lists of IPs reported at ~100% confidence, built from AbuseIPDB (with
+permission) and other free sources, updated several times a day. No API key needed:
+
+```bash
+abuseipdb-block -b 30d          # or BORESTAD=30d in the config file
+```
+
+Periods: `1d 3d 7d 14d 30d 60d 90d 120d 180d 365d` (IPv4 only; the author recommends
+30 days or less to limit false positives; `-b api` goes back to the API). The download
+is rejected if its `Number of ips` header does not match the content, or if its
+`Last updated` header is older than `MAXAGE` days. Please support AbuseIPDB if you use it.
 
 ## Install
 
@@ -46,7 +62,7 @@ sudo install -m 644 abuseipdb-block.cron /etc/cron.d/abuseipdb-block
 ## Usage
 
 ```
-abuseipdb-block [-c FILE] [-q] [-n]   download and apply the list
+abuseipdb-block [-c FILE] [-b PERIOD] [-q] [-n]   download and apply the list
 abuseipdb-block -r [-q]                reload the last saved list (for boot)
 abuseipdb-block -s                     status: loaded IPs, list age, dropped packets
 abuseipdb-block -u IP                  unblock IP until the next update
